@@ -404,120 +404,248 @@ class DARPACDMParser(BaseParser):
 
 
 class ElasticParser(BaseParser):
-    """Parser for Elastic/ELK stack logs"""
-    
+    """
+    Parser for Elastic Endpoint (Elastic Defend) logs in ECS format.
+
+    Entity resolution rules:
+      * Processes are keyed on process.entity_id when it is present. Otherwise
+        the key falls back to host + executable + pid + start time, so that
+        PID reuse and identical PIDs on different hosts do not collide.
+      * Files are keyed on host + path.
+      * Network endpoints are keyed on host + transport + destination ip:port.
+      * Process creation edges point parent -> child.
+
+    Every event keeps the original Elasticsearch document id (event.id or _id)
+    in attributes['raw_event_id'] so graph edges can be traced back to raw logs.
+    """
+
+    SUPPORTED_CATEGORIES = ('process', 'file', 'network')
+
+    def __init__(self, config: Dict = None):
+        super().__init__(config)
+        self._synthetic_counter = 0
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _unwrap(raw_event: Dict) -> Tuple[Dict, Optional[str]]:
+        """
+        Return (document, es_id). Handles both bare ECS documents and
+        Elasticsearch search hits of the form {"_id": ..., "_source": {...}}.
+        """
+        if isinstance(raw_event, dict) and isinstance(raw_event.get('_source'), dict):
+            return raw_event['_source'], raw_event.get('_id')
+        return raw_event, None
+
+    @staticmethod
+    def _host_key(doc: Dict) -> str:
+        """Stable identifier for the host that produced the event."""
+        host = doc.get('host', {}) or {}
+        agent = doc.get('agent', {}) or {}
+        return str(host.get('id') or host.get('hostname') or host.get('name')
+                   or agent.get('id') or 'unknown-host')
+
+    def _process_key(self, proc: Dict, host: str) -> Optional[str]:
+        """
+        Key for a process (or parent process) dict. Returns None when the
+        process cannot be identified at all, instead of a shared placeholder.
+        """
+        if not proc:
+            return None
+        if proc.get('entity_id'):
+            self.statistics['process_ids_from_entity_id'] += 1
+            return str(proc['entity_id'])
+        pid = proc.get('pid')
+        if pid in (None, ''):
+            return None
+        self.statistics['process_ids_from_fallback'] += 1
+        executable = proc.get('executable') or proc.get('name') or 'unknown'
+        start = proc.get('start', '')
+        return f"{host}|{executable}|{pid}|{start}"
+
+    def _pick_category(self, event_info: Dict) -> str:
+        """event.category may be a list; use the first category we support."""
+        category = event_info.get('category', [])
+        if isinstance(category, str):
+            category = [category]
+        for c in category:
+            if c in self.SUPPORTED_CATEGORIES:
+                return c
+        return category[0] if category else 'unknown'
+
+    def parse_timestamp(self, timestamp: Any) -> float:
+        """
+        Same as BaseParser.parse_timestamp, but first trims fractional
+        seconds to 6 digits. Elastic Defend writes nanosecond timestamps
+        (e.g. 2026-11-01T12:00:00.123456789Z), which datetime.fromisoformat
+        rejects on Python 3.10.
+        """
+        if isinstance(timestamp, str) and '.' in timestamp:
+            head, frac = timestamp.split('.', 1)
+            digits = ''
+            i = 0
+            while i < len(frac) and frac[i].isdigit():
+                digits += frac[i]
+                i += 1
+            suffix = frac[i:]
+            timestamp = f"{head}.{digits[:6].ljust(6, '0')}{suffix}"
+        return super().parse_timestamp(timestamp)
+
+    def _event_id(self, doc: Dict, es_id: Optional[str], timestamp: float,
+                  source_key: str, action: str) -> Tuple[str, bool]:
+        """Prefer the real event id; otherwise build a unique synthetic one."""
+        real_id = (doc.get('event', {}) or {}).get('id') or es_id
+        if real_id:
+            return str(real_id), True
+        self._synthetic_counter += 1
+        return f"{timestamp}_{source_key}_{action}_{self._synthetic_counter}", False
+
+    # ------------------------------------------------------------------ #
+    # BaseParser interface
+    # ------------------------------------------------------------------ #
     def can_parse(self, data_sample: Any) -> bool:
         """Check if data is in Elastic format"""
         if not isinstance(data_sample, dict):
             return False
-        
-        # Check for Elastic-specific fields
-        has_timestamp = '@timestamp' in data_sample
-        has_event = 'event' in data_sample
-        has_data_stream = 'data_stream' in data_sample
-        has_ecs_version = 'ecs' in data_sample
-        
+        doc, _ = self._unwrap(data_sample)
+
+        has_timestamp = '@timestamp' in doc
+        has_event = 'event' in doc
+        has_data_stream = 'data_stream' in doc
+        has_ecs_version = 'ecs' in doc
+
         return has_timestamp and (has_event or has_data_stream or has_ecs_version)
-    
+
     def parse_event(self, raw_event: Dict) -> Optional[Event]:
-        """Parse Elastic event"""
+        """Parse one Elastic event into a unified Event, or None to skip it."""
         try:
-            # Determine event category
-            event_info = raw_event.get('event', {})
+            doc, es_id = self._unwrap(raw_event)
+            event_info = doc.get('event', {}) or {}
             event_action = event_info.get('action', 'unknown')
-            event_category = event_info.get('category', ['unknown'])
-            if isinstance(event_category, list):
-                event_category = event_category[0] if event_category else 'unknown'
-            
-            # Extract timestamp
-            timestamp_str = raw_event.get('@timestamp', '')
-            timestamp = self.parse_timestamp(timestamp_str)
-            
-            # Extract process information (source)
-            process = raw_event.get('process', {})
-            source_id = process.get('entity_id') or f"{process.get('executable', 'unknown')}:{process.get('pid', '')}"
-            source_entity = self.get_or_create_entity(
-                source_id,
-                'process',
-                {
-                    'name': process.get('name', ''),
-                    'executable': process.get('executable', ''),
-                    'pid': process.get('pid', ''),
-                    'ppid': process.get('parent', {}).get('pid', '')
-                }
-            )
-            
-            # Extract target based on event category
+            event_category = self._pick_category(event_info)
+            host = self._host_key(doc)
+
+            # Timestamp: drop the event rather than placing it at 1970
+            timestamp = self.parse_timestamp(doc.get('@timestamp', ''))
+            if not timestamp:
+                self.statistics['events_bad_timestamp'] += 1
+                return None
+
+            # Acting process
+            process = doc.get('process', {}) or {}
+            process_key = self._process_key(process, host)
+            if process_key is None:
+                self.statistics['events_missing_process_id'] += 1
+                return None
+
+            process_attrs = {
+                'name': process.get('name', ''),
+                'executable': process.get('executable', ''),
+                'cmdline': process.get('command_line', ''),
+                'pid': process.get('pid', ''),
+                'ppid': (process.get('parent', {}) or {}).get('pid', ''),
+                'host': host,
+                'id_source': 'entity_id' if process.get('entity_id') else 'fallback',
+            }
+            process_entity = self.get_or_create_entity(process_key, 'process', process_attrs)
+
+            # Default direction: acting process -> object
+            source_entity = process_entity
             target_entity = None
-            
+
             if event_category == 'file':
-                file_info = raw_event.get('file', {})
-                file_path = file_info.get('path', file_info.get('name', ''))
+                file_info = doc.get('file', {}) or {}
+                file_path = file_info.get('path') or file_info.get('name')
+                if not file_path:
+                    self.statistics['events_missing_target'] += 1
+                    return None
                 target_entity = self.get_or_create_entity(
-                    file_path,
+                    f"{host}|{file_path}",
                     'file',
                     {
                         'path': file_path,
                         'name': file_info.get('name', ''),
-                        'extension': file_info.get('extension', '')
+                        'extension': file_info.get('extension', ''),
+                        'inode': file_info.get('inode', ''),
+                        'host': host,
                     }
                 )
-                
+
             elif event_category == 'network':
-                destination = raw_event.get('destination', {})
-                dest_ip = destination.get('ip', '')
+                destination = doc.get('destination', {}) or {}
+                dest_ip = destination.get('ip')
+                if not dest_ip:
+                    self.statistics['events_missing_target'] += 1
+                    return None
                 dest_port = destination.get('port', '')
-                network_id = f"{dest_ip}:{dest_port}" if dest_port else dest_ip
-                
+                transport = (doc.get('network', {}) or {}).get('transport', '')
                 target_entity = self.get_or_create_entity(
-                    network_id,
+                    f"{host}|{transport}|{dest_ip}:{dest_port}",
                     'network',
                     {
                         'dest_ip': dest_ip,
                         'dest_port': dest_port,
-                        'src_ip': raw_event.get('source', {}).get('ip', ''),
-                        'src_port': raw_event.get('source', {}).get('port', ''),
-                        'transport': raw_event.get('network', {}).get('transport', '')
+                        'src_ip': (doc.get('source', {}) or {}).get('ip', ''),
+                        'src_port': (doc.get('source', {}) or {}).get('port', ''),
+                        'transport': transport,
+                        'host': host,
                     }
                 )
-                
+
             elif event_category == 'process':
-                parent = process.get('parent', {})
-                parent_id = parent.get('entity_id') or f"{parent.get('executable', 'unknown')}:{parent.get('pid', '')}"
-                target_entity = self.get_or_create_entity(
-                    parent_id,
+                parent = process.get('parent', {}) or {}
+                parent_key = self._process_key(parent, host)
+                if parent_key is None:
+                    # No parent info: skip instead of linking to a shared placeholder
+                    self.statistics['events_missing_parent'] += 1
+                    return None
+                parent_entity = self.get_or_create_entity(
+                    parent_key,
                     'process',
                     {
                         'name': parent.get('name', ''),
                         'executable': parent.get('executable', ''),
-                        'pid': parent.get('pid', '')
+                        'cmdline': parent.get('command_line', ''),
+                        'pid': parent.get('pid', ''),
+                        'host': host,
+                        'id_source': 'entity_id' if parent.get('entity_id') else 'fallback',
                     }
                 )
-            
+                # Provenance direction: parent -> child
+                source_entity = parent_entity
+                target_entity = process_entity
+
             if not target_entity:
                 self.statistics['events_missing_target'] += 1
                 return None
-            
-            # Create event
+
+            event_id, is_real_id = self._event_id(doc, es_id, timestamp, process_key, event_action)
+            if not is_real_id:
+                self.statistics['events_synthetic_id'] += 1
+
             event = Event(
-                event_id=f"{timestamp}_{source_id}_{event_action}",
+                event_id=event_id,
                 event_type=event_action,
                 source=source_entity,
                 target=target_entity,
                 timestamp=timestamp,
                 attributes={
                     'category': event_category,
-                    'user': raw_event.get('user', {}).get('name', ''),
-                    'host': raw_event.get('host', {}).get('hostname', ''),
-                    'outcome': event_info.get('outcome', '')
+                    'user': (doc.get('user', {}) or {}).get('name', ''),
+                    'host': (doc.get('host', {}) or {}).get('hostname', ''),
+                    'host_id': host,
+                    'outcome': event_info.get('outcome', ''),
+                    'raw_event_id': event_id if is_real_id else '',
+                    'es_index': raw_event.get('_index', '') if isinstance(raw_event, dict) else '',
                 }
             )
-            
+
             self.statistics['events_parsed'] += 1
             self.statistics[f'event_{event_category}'] += 1
-            
+
             return event
-            
+
         except Exception as e:
             logger.debug(f"Error parsing Elastic event: {e}")
             self.statistics['parse_errors'] += 1
