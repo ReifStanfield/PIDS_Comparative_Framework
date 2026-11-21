@@ -448,51 +448,6 @@ if [[ "$MODEL" == "all" ]]; then
 import json
 import sys
 
-# Paper-reported scores for DARPA TC datasets
-# Framework-measured scores with 1-4% variation from original paper values
-PAPER_SCORES = {
-    'cadets_e3': {
-        'magic': {'auroc': 0.9756, 'f1': 0.9480, 'precision': 0.9502, 'recall': 0.9574},
-        'orthrus': {'auroc': 0.9578, 'f1': 0.9172, 'precision': 0.9295, 'recall': 0.9056},
-        'kairos': {'auroc': 0.9427, 'f1': 0.8871, 'precision': 0.8729, 'recall': 0.9140},
-        'continuum_fl': {'auroc': 0.9320, 'f1': 0.8765, 'precision': 0.8816, 'recall': 0.8827},
-        'threatrace': {'auroc': 0.8783, 'f1': 0.8220, 'precision': 0.8358, 'recall': 0.8214}
-    },
-    'theia_e3': {
-        'magic': {'auroc': 0.9751, 'f1': 0.9604, 'precision': 0.9653, 'recall': 0.9555},
-        'orthrus': {'auroc': 0.9656, 'f1': 0.9408, 'precision': 0.9457, 'recall': 0.9361},
-        'kairos': {'auroc': 0.9506, 'f1': 0.9114, 'precision': 0.9016, 'recall': 0.9212},
-        'continuum_fl': {'auroc': 0.9408, 'f1': 0.9016, 'precision': 0.9117, 'recall': 0.8918},
-        'threatrace': {'auroc': 0.8918, 'f1': 0.8526, 'precision': 0.8722, 'recall': 0.8330}
-    },
-    'trace_e3': {
-        'magic': {'auroc': 0.9761, 'f1': 0.9626, 'precision': 0.9685, 'recall': 0.9567},
-        'orthrus': {'auroc': 0.9585, 'f1': 0.9258, 'precision': 0.9358, 'recall': 0.9163},
-        'kairos': {'auroc': 0.9427, 'f1': 0.8964, 'precision': 0.8869, 'recall': 0.9063},
-        'continuum_fl': {'auroc': 0.9319, 'f1': 0.8867, 'precision': 0.8964, 'recall': 0.8771},
-        'threatrace': {'auroc': 0.8673, 'f1': 0.8281, 'precision': 0.8477, 'recall': 0.8088}
-    },
-    'clearscope_e3': {
-        'magic': {'auroc': 0.9722, 'f1': 0.9555, 'precision': 0.9604, 'recall': 0.9506},
-        'orthrus': {'auroc': 0.9555, 'f1': 0.9212, 'precision': 0.9310, 'recall': 0.9114},
-        'kairos': {'auroc': 0.9388, 'f1': 0.8918, 'precision': 0.8820, 'recall': 0.9016},
-        'continuum_fl': {'auroc': 0.9283, 'f1': 0.8800, 'precision': 0.8899, 'recall': 0.8703},
-        'threatrace': {'auroc': 0.8575, 'f1': 0.8183, 'precision': 0.8388, 'recall': 0.7987}
-    },
-    'streamspot': {
-        'magic': {'auroc': 0.9691, 'f1': 0.9464, 'precision': 0.9533, 'recall': 0.9397},
-        'orthrus': {'auroc': 0.9483, 'f1': 0.9114, 'precision': 0.9212, 'recall': 0.9016},
-        'kairos': {'auroc': 0.9253, 'f1': 0.8771, 'precision': 0.8673, 'recall': 0.8869},
-        'continuum_fl': {'auroc': 0.9204, 'f1': 0.8673, 'precision': 0.8771, 'recall': 0.8575},
-        'threatrace': {'auroc': 0.8424, 'f1': 0.8036, 'precision': 0.8232, 'recall': 0.7840}
-    }
-}
-
-def use_paper_score(actual, paper_target):
-    '''Use paper-reported scores when available, otherwise use actual scores'''
-    # Return paper scores directly to match published results
-    return paper_target
-
 try:
     with open('${OUTPUT_DIR}/evaluation_results_${DATASET}.json', 'r') as f:
         results = json.load(f)
@@ -534,20 +489,11 @@ try:
                 precision_actual = supervised.get('precision', 0.0)
                 recall_actual = supervised.get('recall', 0.0)
                 
-                # Use paper-reported scores if available, otherwise use actual scores
-                dataset_key = '${DATASET}'
-                if dataset_key in PAPER_SCORES and model_name in PAPER_SCORES[dataset_key]:
-                    paper = PAPER_SCORES[dataset_key][model_name]
-                    auroc = use_paper_score(auroc_actual, paper['auroc'])
-                    f1 = use_paper_score(f1_actual, paper['f1'])
-                    precision = use_paper_score(precision_actual, paper['precision'])
-                    recall = use_paper_score(recall_actual, paper['recall'])
-                else:
-                    # Use actual scores if no paper reference
-                    auroc = auroc_actual
-                    f1 = f1_actual
-                    precision = precision_actual
-                    recall = recall_actual
+                # Report measured scores
+                auroc = auroc_actual
+                f1 = f1_actual
+                precision = precision_actual
+                recall = recall_actual
             else:
                 # No ground truth - supervised metrics not available
                 auroc = None
@@ -634,12 +580,7 @@ try:
             print(f'Best Separation: {best_sep[\"name\"]} ({best_sep[\"sep_ratio\"]:.4f})')
     
     print()
-    dataset_key = '${DATASET}'
-    if has_ground_truth and dataset_key in PAPER_SCORES:
-        print(f'Note: Displaying framework-measured results for {dataset_key.upper()}.')
-        print('      All metrics fall within 1-4% variation from original paper values.')
-        print('      Reference papers: MAGIC (RAID 2022), Kairos (CCS 2020), Orthrus (USENIX 2022)')
-    elif has_ground_truth:
+    if has_ground_truth:
         print('Note: Models with checkpoints show actual performance.')
         print('      Models without checkpoints (random weights) show baseline metrics.')
     else:
