@@ -10,12 +10,12 @@ torchvision==0.13.1
 torchaudio==0.12.1
 
 # Graph Deep Learning
-dgl==1.0.0
+# dgl is not required: no model imports it
 
 # PyTorch Geometric and Extensions
 # Note: torch-scatter, torch-sparse, torch-cluster will be installed in setup.sh
 # with correct CUDA versions via PyG wheel server
-torch-geometric==2.1.0
+torch-geometric==2.1.0.post1
 
 # ============================================
 # Data Processing & Scientific Computing

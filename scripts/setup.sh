@@ -4,14 +4,14 @@
 #
 # This script sets up the complete framework environment:
 #   - Creates conda environment from environment.yml
-#   - Installs PyTorch, DGL, PyTorch Geometric and all dependencies
-#   - Applies PyTorch MKL threading fix
+#     (PyTorch 1.12.1+cu116 and PyTorch Geometric come from pip wheels there)
+#   - Applies PyTorch MKL threading setting
 #   - Creates directory structure
 #   - Verifies installation
 #
 # Prerequisites:
-#   - Conda (Anaconda or Miniconda) must be installed
-#   - CUDA 11.6+ (optional, for GPU support)
+#   - Conda (Miniforge recommended) must be installed
+#   - NVIDIA driver supporting CUDA 11.6 or newer (optional, for GPU support)
 #
 # Usage:
 #   ./scripts/setup.sh
@@ -153,28 +153,19 @@ print_info "✓ MKL threading fix applied (will auto-activate with environment)"
 
 # Test PyTorch import
 print_info "Testing PyTorch import..."
-if python -c "import torch; print(f'PyTorch {torch.__version__} loaded successfully!')" 2>/dev/null; then
+if python -c "import torch; print(f'PyTorch {torch.__version__} loaded successfully!')"; then
     print_info "✓ PyTorch is working!"
 else
-    print_warning "PyTorch import test failed. Trying alternative fix..."
-    
-    # Method 2: Reinstall with compatible MKL
-    print_info "Reinstalling MKL to compatible version..."
-    conda install "mkl<2024" -c conda-forge --force-reinstall -y
-    
-    # Test again
-    if python -c "import torch; print(f'PyTorch {torch.__version__} loaded successfully!')" 2>/dev/null; then
-        print_info "✓ PyTorch is working after MKL reinstall!"
-    else
-        print_error "PyTorch still not working. Manual intervention may be required."
-        print_error "Please see documentation for advanced troubleshooting."
-    fi
+    # Do NOT "fix" this with conda install mkl: that replaces the pip PyTorch
+    # wheel with conda-forge's build, which breaks the PyG extensions.
+    print_error "PyTorch failed to import. Recreate the environment from environment.yml."
+    exit 1
 fi
 
 echo ""
 
 # Step 6: Create directory structure
-print_step "Step 6/7: Creating directory structure and installing PyTorch Geometric"
+print_step "Step 6/7: Creating directory structure"
 
 # First create directories
 mkdir -p data/{darpa_tc,streamspot,custom,processed,cache}
@@ -186,50 +177,11 @@ mkdir -p artifacts
 
 print_info "Directory structure created"
 
-# Now install PyTorch Geometric and extensions with MKL fix applied
-print_info "Installing PyTorch Geometric and extensions (with MKL fix applied)..."
-
-# Detect CUDA version for appropriate wheels
-PYTHON_CHECK='import torch
-try:
-    cuda = torch.version.cuda
-    if cuda and "11.6" in str(cuda):
-        print("cu116")
-    elif cuda and "11.3" in str(cuda):
-        print("cu113")
-    else:
-        print("cpu")
-except:
-    print("cpu")
-'
-
-PYG_CUDA_TAG=$(python -c "$PYTHON_CHECK")
-
-if [ "${PYG_CUDA_TAG}" = "cu116" ]; then
-    TORCH_VERSION="1.12.1"
-    CUDA_VERSION="cu116"
-    print_info "Detected CUDA 11.6, installing CUDA-enabled PyG extensions"
-elif [ "${PYG_CUDA_TAG}" = "cu113" ]; then
-    TORCH_VERSION="1.12.1"
-    CUDA_VERSION="cu113"
-    print_info "Detected CUDA 11.3, installing CUDA-enabled PyG extensions"
-else
-    TORCH_VERSION="1.12.1"
-    CUDA_VERSION="cpu"
-    print_info "Installing CPU-only PyG extensions"
-fi
-
-# Install PyTorch Geometric extensions with appropriate CUDA support
-print_info "Installing torch-scatter, torch-sparse, torch-cluster..."
-pip install --no-cache-dir torch-scatter==2.1.0 -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
-pip install --no-cache-dir torch-sparse==0.6.16 -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
-pip install --no-cache-dir torch-cluster==1.6.0 -f https://data.pyg.org/whl/torch-${TORCH_VERSION}+${CUDA_VERSION}.html
-
-# Install PyTorch Geometric itself
-print_info "Installing torch-geometric..."
-pip install --no-cache-dir torch-geometric==2.1.0
-
-print_info "✓ PyTorch Geometric and extensions installed successfully"
+# PyTorch and PyTorch Geometric are installed by environment.yml (pip wheels).
+# DGL is not installed: no model in this framework imports it (MAGIC is
+# implemented on PyG here). If a checkpoint ever fails to load with
+# "No module named dgl", install it with:
+#   conda install -n pids_framework --no-deps -c dglteam/label/cu116 dgl=1.0.0
 
 echo ""
 echo "Directory structure:"
@@ -256,11 +208,26 @@ python -c "import torch; print(f'PyTorch version: {torch.__version__}')" || {
 print_info "Checking CUDA availability..."
 python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda if torch.cuda.is_available() else \"N/A\"}'); print(f'Number of GPUs: {torch.cuda.device_count() if torch.cuda.is_available() else 0}')"
 
-print_info "Checking DGL installation..."
-python -c "import dgl; print(f'DGL version: {dgl.__version__}')" || print_warning "DGL not installed or not working"
+print_info "Checking PyTorch Geometric (including torch-scatter/sparse/cluster)..."
+python -c "import torch_geometric, torch_scatter, torch_sparse, torch_cluster; print(f'PyG version: {torch_geometric.__version__}')" || {
+    print_error "PyTorch Geometric failed to import (usually a PyTorch/PyG wheel mismatch)"
+    exit 1
+}
 
-print_info "Checking PyTorch Geometric..."
-python -c "import torch_geometric; print(f'PyG version: {torch_geometric.__version__}')" || print_warning "PyG not installed or not working"
+if python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"; then
+    print_info "Checking GPU operations..."
+    python -c "
+import torch, torch_scatter
+i = torch.tensor([0, 0, 1, 1], device='cuda')
+assert torch_scatter.scatter_add(torch.ones(4, device='cuda'), i).tolist() == [2.0, 2.0]
+print(f'✓ GPU OK: {torch.cuda.get_device_name(0)} (PyG CUDA ops working)')
+" || {
+    print_error "GPU detected but a PyG CUDA operation failed"
+    exit 1
+}
+else
+    print_warning "No GPU detected; models will run on CPU"
+fi
 
 echo ""
 
@@ -270,7 +237,7 @@ python -c "
 import sys
 try:
     import torch
-    import dgl
+    import torch_geometric
     import numpy as np
     import sklearn
     import yaml

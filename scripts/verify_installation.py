@@ -102,13 +102,12 @@ def check_deep_learning_frameworks():
         print_failure("PyTorch        - NOT INSTALLED")
         all_good = False
     
-    # Check DGL
+    # Check DGL (optional: no model in this framework imports it)
     try:
         import dgl
-        print_success(f"DGL            - version {dgl.__version__}")
+        print_success(f"DGL            - version {dgl.__version__} (optional)")
     except ImportError:
-        print_failure("DGL            - NOT INSTALLED")
-        all_good = False
+        print_success("DGL            - not installed (optional, unused)")
     
     # Check PyTorch Geometric
     try:

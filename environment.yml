@@ -3,23 +3,16 @@
 # Creates environment with Python 3.10, PyTorch, and all required dependencies
 
 name: pids_framework
+# conda-forge only: the Anaconda "defaults" channel can require a paid license
+# at large institutions, and conda's PyTorch builds caused MKL and C++ ABI
+# conflicts with the PyG extension wheels. PyTorch and PyG come from their
+# official pip wheels below. DGL is not needed (no model imports it).
 channels:
-  - pytorch
   - conda-forge
-  - dglteam
-  - defaults
 
 dependencies:
   - python=3.10
   - pip
-  
-  # ============================================
-  # PyTorch with CUDA support
-  # ============================================
-  - pytorch=1.12.1
-  - torchvision=0.13.1
-  - torchaudio=0.12.1
-  - cudatoolkit=11.6
   
   # ============================================
   # Scientific Computing
@@ -71,9 +64,20 @@ dependencies:
   # Pip Dependencies
   # ============================================
   - pip:
-    # Core graph deep learning
-    - dgl==1.0.0
-    
+    # PyTorch 1.12.1 + CUDA 11.6 (official wheels; they also run on CPU-only machines)
+    - --extra-index-url https://download.pytorch.org/whl/cu116
+    - torch==1.12.1+cu116
+    - torchvision==0.13.1+cu116
+    - torchaudio==0.12.1
+
+    # PyTorch Geometric extensions built for torch 1.12.1 + cu116
+    - --find-links https://data.pyg.org/whl/torch-1.12.1+cu116.html
+    - torch-scatter==2.1.0
+    - torch-sparse==0.6.16
+    - torch-cluster==1.6.0
+    # 2.1.0 was yanked (missing templates); 2.1.0.post1 is the fixed release
+    - torch-geometric==2.1.0.post1
+
     # Model-specific utilities
     - xxhash==3.2.0
     - graphviz==0.20.1
